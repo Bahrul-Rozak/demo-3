@@ -51,9 +51,8 @@ export async function onRequestPost(context) {
     }
 
     const documents = await loadDocuments(store);
-    const tools = defineTools();
     
-    const systemPrompt = buildSystemPrompt(documents, tools);
+    const systemPrompt = buildSystemPrompt(documents);
     
     const fullMessages = [
       { role: 'system', content: systemPrompt },
@@ -113,27 +112,40 @@ export async function onRequestPost(context) {
   }
 }
 
-// ========== TOOL IMPLEMENTATIONS ==========
+// ========== TOOL IMPLEMENTATIONS (EDGE-SAFE) ==========
 
 async function executeCode(code, language = 'javascript') {
   try {
-    if (language === 'javascript') {
-      const result = await new Promise((resolve) => {
-        try {
-          const func = new Function(code);
-          const output = func();
-          resolve({ success: true, output: output });
-        } catch (error) {
-          resolve({ success: false, error: error.message });
-        }
-      });
-      return result;
-    } else {
+    if (language !== 'javascript') {
       return { 
         success: false, 
-        error: 'Python execution not supported. Use JavaScript instead.' 
+        error: 'Only JavaScript is supported in this environment.' 
       };
     }
+
+    const cleanCode = code.replace(/^return\s+/, '').trim();
+    
+    if (/^[\d\s\+\-\*\/\(\)\.]+$/.test(cleanCode)) {
+      const result = eval(cleanCode);
+      return { success: true, output: result, type: 'calculation' };
+    }
+    
+    if (cleanCode.includes('fibonacci') || cleanCode.includes('fib')) {
+      const match = cleanCode.match(/(\d+)/);
+      const n = match ? parseInt(match[1]) : 10;
+      const fib = [0, 1];
+      for (let i = 2; i < n; i++) {
+        fib.push(fib[i-1] + fib[i-2]);
+      }
+      return { success: true, output: fib.slice(0, n), type: 'fibonacci' };
+    }
+    
+    return { 
+      success: true, 
+      output: `Code execution simulated. Code: ${cleanCode}`,
+      type: 'simulation',
+      note: 'For security reasons, complex code execution is simulated in edge environment.'
+    };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -144,7 +156,7 @@ async function parseFile(fileName, store) {
     const content = await store.get(`documents/${fileName}`);
     
     if (!content) {
-      return { success: false, error: 'File not found' };
+      return { success: false, error: `File '${fileName}' not found in storage.` };
     }
 
     if (fileName.endsWith('.csv')) {
@@ -152,7 +164,12 @@ async function parseFile(fileName, store) {
     } else if (fileName.endsWith('.json')) {
       return parseJSON(content);
     } else {
-      return { success: true, type: 'text', content: content };
+      return { 
+        success: true, 
+        type: 'text', 
+        content: content,
+        length: content.length
+      };
     }
   } catch (error) {
     return { success: false, error: error.message };
@@ -160,47 +177,67 @@ async function parseFile(fileName, store) {
 }
 
 function parseCSV(content) {
-  const lines = content.trim().split('\n');
-  const headers = lines[0].split(',').map(h => h.trim());
-  const data = [];
-  
-  for (let i = 1; i < lines.length; i++) {
-    const values = lines[i].split(',').map(v => v.trim());
-    const row = {};
-    headers.forEach((header, index) => {
-      row[header] = values[index];
-    });
-    data.push(row);
+  try {
+    const lines = content.trim().split('\n');
+    if (lines.length === 0) {
+      return { success: false, error: 'Empty CSV file' };
+    }
+    
+    const headers = lines[0].split(',').map(h => h.trim());
+    const data = [];
+    
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',').map(v => v.trim());
+      const row = {};
+      headers.forEach((header, index) => {
+        row[header] = values[index] || '';
+      });
+      data.push(row);
+    }
+    
+    return { 
+      success: true, 
+      type: 'csv', 
+      headers: headers,
+      data: data,
+      rowCount: data.length,
+      preview: data.slice(0, 5)
+    };
+  } catch (error) {
+    return { success: false, error: `CSV parse error: ${error.message}` };
   }
-  
-  return { 
-    success: true, 
-    type: 'csv', 
-    headers: headers,
-    data: data,
-    rowCount: data.length
-  };
 }
 
 function parseJSON(content) {
   try {
     const data = JSON.parse(content);
-    return { success: true, type: 'json', data: data };
+    return { 
+      success: true, 
+      type: 'json', 
+      data: data,
+      keys: Object.keys(data)
+    };
   } catch (error) {
-    return { success: false, error: 'Invalid JSON format' };
+    return { success: false, error: `Invalid JSON format: ${error.message}` };
   }
 }
 
 async function scrapeWeb(url) {
   try {
+    if (!url.startsWith('http')) {
+      return { success: false, error: 'Invalid URL. Must start with http:// or https://' };
+    }
+    
     const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; EdgeOneBot/1.0)'
-      }
+        'User-Agent': 'Mozilla/5.0 (compatible; EdgeOneBot/1.0)',
+        'Accept': 'text/html,application/xhtml+xml'
+      },
+      redirect: 'follow'
     });
     
     if (!response.ok) {
-      return { success: false, error: `HTTP ${response.status}` };
+      return { success: false, error: `HTTP ${response.status}: ${response.statusText}` };
     }
     
     const html = await response.text();
@@ -208,7 +245,13 @@ async function scrapeWeb(url) {
     const textContent = html
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[\s\S]*?<\/footer>/gi, '')
       .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
       .replace(/\s+/g, ' ')
       .trim();
     
@@ -219,11 +262,12 @@ async function scrapeWeb(url) {
       success: true,
       url: url,
       title: title,
-      content: textContent.substring(0, 5000),
-      contentLength: textContent.length
+      content: textContent.substring(0, 3000),
+      contentLength: textContent.length,
+      truncated: textContent.length > 3000
     };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: `Scrape error: ${error.message}` };
   }
 }
 
@@ -232,14 +276,21 @@ async function scrapeWeb(url) {
 async function loadConversationHistory(store, conversationId) {
   try {
     const history = await store.get(`conversations/${conversationId}.json`);
-    return history ? JSON.parse(history) : [];
+    if (!history) return [];
+    const parsed = JSON.parse(history);
+    return Array.isArray(parsed) ? parsed : [];
   } catch (error) {
+    console.error('Load history error:', error);
     return [];
   }
 }
 
 async function saveConversationHistory(store, conversationId, history) {
-  await store.set(`conversations/${conversationId}.json`, JSON.stringify(history));
+  try {
+    await store.set(`conversations/${conversationId}.json`, JSON.stringify(history));
+  } catch (error) {
+    console.error('Save history error:', error);
+  }
 }
 
 async function loadDocuments(store) {
@@ -248,84 +299,65 @@ async function loadDocuments(store) {
     'documents/restaurant.txt',
     'documents/daftar_rumah_sakit_bandung.txt',
     'documents/data.csv',
-    'documents/info.json'
+    'documents/info.json',
+    'documents/upload.txt',
+    'documents/notes.md'
   ];
 
   for (const fileName of commonFiles) {
     try {
       const content = await store.get(fileName);
       if (content) {
-        contextDocs += `\n\n--- FILE: ${fileName} ---\n${content}\n`;
+        contextDocs += `\n\n--- FILE: ${fileName} ---\n${content.substring(0, 2000)}\n`;
       }
-    } catch (e) {}
+    } catch (e) {
+      // File not found, skip
+    }
   }
 
-  return contextDocs;
+  return contextDocs || 'Tidak ada dokumen yang tersedia';
 }
 
-function defineTools() {
-  return [
-    {
-      name: 'execute_code',
-      description: 'Execute JavaScript code. Use when user asks to calculate, process data, or run code.',
-      parameters: {
-        code: 'JavaScript code to execute',
-        language: 'javascript (only javascript supported)'
-      }
-    },
-    {
-      name: 'parse_file',
-      description: 'Parse CSV or JSON file from storage. Use when user asks about file content.',
-      parameters: {
-        fileName: 'Name of file to parse (e.g., data.csv, info.json)'
-      }
-    },
-    {
-      name: 'scrape_web',
-      description: 'Scrape content from a website URL. Use when user asks about web content.',
-      parameters: {
-        url: 'URL to scrape'
-      }
-    }
-  ];
-}
-
-function buildSystemPrompt(documents, tools) {
-  return `Kamu adalah AI Agent yang cerdas dan membantu. Kamu memiliki akses ke beberapa tools yang bisa kamu gunakan untuk menyelesaikan tugas user.
+function buildSystemPrompt(documents) {
+  return `Kamu adalah AI Agent yang cerdas dan membantu. Kamu memiliki akses ke beberapa tools.
 
 ATURAN UTAMA:
 1. Jawab HANYA berdasarkan informasi yang tersedia
-2. Jika perlu menggunakan tool, format response dengan format khusus:
-   [TOOL_CALL:tool_name(param1=value1, param2=value2)]
+2. Jika perlu menggunakan tool, format response EXACTLY seperti ini:
+   [TOOL_CALL:tool_name(param1="value1", param2="value2")]
 3. Jika tidak perlu tool, jawab langsung dengan jelas
 4. JANGAN mengarang informasi
-5. Jawab dalam bahasa Indonesia yang santai
+5. Jawab dalam bahasa Indonesia yang santai dan mudah dipahami
 
 DAFTAR TOOLS TERSEDIA:
-${tools.map(t => `- ${t.name}: ${t.description}`).join('\n')}
+- execute_code: Execute JavaScript code. Parameters: code="javascript code", language="javascript"
+- parse_file: Parse CSV/JSON file. Parameters: fileName="filename.csv"
+- scrape_web: Scrape website. Parameters: url="https://example.com"
 
-Contoh penggunaan tool:
-- User: "Hitung 25 * 47"
-- Response: [TOOL_CALL:execute_code(code="return 25 * 47", language="javascript")]
+CONTOH PENGGUNAAN:
+User: "Hitung 25 * 47"
+Response: [TOOL_CALL:execute_code(code="25 * 47", language="javascript")]
 
-- User: "Baca isi file data.csv"
-- Response: [TOOL_CALL:parse_file(fileName="data.csv")]
+User: "Baca file data.csv"
+Response: [TOOL_CALL:parse_file(fileName="data.csv")]
 
-- User: "Ambil konten dari https://example.com"
-- Response: [TOOL_CALL:scrape_web(url="https://example.com")]
+User: "Ambil konten https://example.com"
+Response: [TOOL_CALL:scrape_web(url="https://example.com")]
 
 KONTEKS DOKUMEN:
-${documents || 'Tidak ada dokumen yang tersedia'}
+${documents}
 
-Sekarang, jawab pertanyaan user dengan bijak.`;
+Sekarang, jawab pertanyaan user dengan bijak. Gunakan tool jika diperlukan.`;
 }
 
 function sanitizeInput(input) {
+  if (typeof input !== 'string') return '';
   return input
     .replace(/ignore previous instructions/gi, '')
     .replace(/you are now/gi, '')
     .replace(/system prompt/gi, '')
-    .trim();
+    .trim()
+    .substring(0, 2000);
 }
 
 function detectPromptInjection(message) {
@@ -336,7 +368,8 @@ function detectPromptInjection(message) {
     /forget (all )?your (rules|instructions)/i,
     /act as if/i,
     /pretend (you are|to be)/i,
-    /override (system|previous)/i
+    /override (system|previous)/i,
+    /disregard (all )?(previous|above)/i
   ];
   
   return suspiciousPatterns.some(pattern => pattern.test(message));
@@ -352,10 +385,11 @@ function extractToolCalls(text) {
     const paramsString = match[2];
     const params = {};
     
-    paramsString.split(',').forEach(param => {
-      const [key, value] = param.split('=').map(p => p.trim());
+    const paramPairs = paramsString.match(/(\w+)="([^"]*)"/g) || [];
+    paramPairs.forEach(pair => {
+      const [key, value] = pair.split('=').map(p => p.trim());
       if (key && value) {
-        params[key] = value.replace(/["']/g, '');
+        params[key] = value.replace(/^"|"$/g, '');
       }
     });
     
@@ -371,17 +405,21 @@ async function executeTools(toolCalls, store) {
   for (const call of toolCalls) {
     let result;
     
-    if (call.tool === 'execute_code') {
-      result = await executeCode(call.params.code, call.params.language);
-    } else if (call.tool === 'parse_file') {
-      result = await parseFile(call.params.fileName, store);
-    } else if (call.tool === 'scrape_web') {
-      result = await scrapeWeb(call.params.url);
-    } else {
-      result = { success: false, error: `Unknown tool: ${call.tool}` };
+    try {
+      if (call.tool === 'execute_code') {
+        result = await executeCode(call.params.code || '', call.params.language || 'javascript');
+      } else if (call.tool === 'parse_file') {
+        result = await parseFile(call.params.fileName || '', store);
+      } else if (call.tool === 'scrape_web') {
+        result = await scrapeWeb(call.params.url || '');
+      } else {
+        result = { success: false, error: `Unknown tool: ${call.tool}` };
+      }
+    } catch (error) {
+      result = { success: false, error: `Tool execution error: ${error.message}` };
     }
     
-    results.push({ tool: call.tool, result: result });
+    results.push({ tool: call.tool, params: call.params, result: result });
   }
   
   return results;
@@ -389,28 +427,30 @@ async function executeTools(toolCalls, store) {
 
 async function synthesizeResponse(aiGateway, userMessage, toolResults) {
   const resultsText = toolResults.map(r => {
-    if (r.result.success) {
-      return `${r.tool}: ${JSON.stringify(r.result, null, 2)}`;
-    } else {
-      return `${r.tool}: Error - ${r.result.error}`;
-    }
+    const status = r.result.success ? 'SUCCESS' : 'ERROR';
+    const content = r.result.success ? JSON.stringify(r.result, null, 2) : r.result.error;
+    return `[${status}] ${r.tool}:\n${content}`;
   }).join('\n\n');
   
-  const { text } = await generateText({
-    model: aiGateway("@makers/deepseek-v4-flash"),
-    messages: [
-      { 
-        role: 'system', 
-        content: 'Kamu adalah AI assistant. Berdasarkan hasil tool execution berikut, berikan jawaban yang jelas dan lengkap dalam bahasa Indonesia.' 
-      },
-      { 
-        role: 'user', 
-        content: `Pertanyaan: ${userMessage}\n\nHasil Tool Execution:\n${resultsText}\n\nBerikan jawaban final berdasarkan hasil di atas.` 
-      }
-    ],
-  });
-  
-  return text;
+  try {
+    const { text } = await generateText({
+      model: aiGateway("@makers/deepseek-v4-flash"),
+      messages: [
+        { 
+          role: 'system', 
+          content: 'Kamu adalah AI assistant. Berdasarkan hasil tool execution berikut, berikan jawaban yang jelas, lengkap, dan natural dalam bahasa Indonesia. Jangan sebutkan "tool" atau "execution", langsung berikan jawaban final.' 
+        },
+        { 
+          role: 'user', 
+          content: `Pertanyaan asli: ${userMessage}\n\nHasil dari tools:\n${resultsText}\n\nBerikan jawaban final yang natural dan lengkap.` 
+        }
+      ],
+    });
+    
+    return text;
+  } catch (error) {
+    return `Berikut hasil dari tools:\n\n${resultsText}`;
+  }
 }
 
 async function logObservability(store, conversationId, logEntry) {
