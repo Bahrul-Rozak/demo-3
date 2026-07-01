@@ -1,5 +1,3 @@
-import { createAiGateway } from "@edgeone/makers-models-provider";
-import { generateText } from "ai";
 import { getStore } from "@edgeone/pages-blob";
 
 const BLOB_NAMESPACE = "memory-makers-cfyznvtdex4f";
@@ -51,7 +49,6 @@ export async function onRequestPost(context) {
     }
 
     const documents = await loadDocuments(store);
-    
     const systemPrompt = buildSystemPrompt(documents);
     
     const fullMessages = [
@@ -60,21 +57,15 @@ export async function onRequestPost(context) {
       { role: 'user', content: sanitizedMessage }
     ];
 
-    const aiGateway = createAiGateway({
-      apiKey: env.MAKERS_MODELS_KEY,
-    });
-
-    const { text } = await generateText({
-      model: aiGateway("@makers/deepseek-v4-flash"),
-      messages: fullMessages,
-    });
-
-    let finalReply = text;
-    const toolCalls = extractToolCalls(text);
+    // DIRECT FETCH KE AI GATEWAY (TANPA SDK)
+    const aiResponse = await callAIGateway(env.MAKERS_MODELS_KEY, fullMessages);
+    
+    let finalReply = aiResponse;
+    const toolCalls = extractToolCalls(aiResponse);
 
     if (toolCalls.length > 0) {
       const toolResults = await executeTools(toolCalls, store);
-      finalReply = await synthesizeResponse(aiGateway, sanitizedMessage, toolResults);
+      finalReply = await synthesizeResponse(env.MAKERS_MODELS_KEY, sanitizedMessage, toolResults);
     }
 
     history.push(
@@ -112,7 +103,44 @@ export async function onRequestPost(context) {
   }
 }
 
-// ========== TOOL IMPLEMENTATIONS (EDGE-SAFE) ==========
+// ========== DIRECT AI GATEWAY CALL ==========
+
+async function callAIGateway(apiKey, messages) {
+  try {
+    const response = await fetch('https://ai-gateway.edgeone.link/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: '@makers/deepseek-v4-flash',
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 2000,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('AI Gateway error:', errorText);
+      throw new Error(`AI Gateway returned ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json();
+    
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      throw new Error('Invalid response format from AI Gateway');
+    }
+
+    return data.choices[0].message.content;
+  } catch (error) {
+    console.error('callAIGateway error:', error);
+    throw error;
+  }
+}
+
+// ========== TOOL IMPLEMENTATIONS ==========
 
 async function executeCode(code, language = 'javascript') {
   try {
@@ -310,9 +338,7 @@ async function loadDocuments(store) {
       if (content) {
         contextDocs += `\n\n--- FILE: ${fileName} ---\n${content.substring(0, 2000)}\n`;
       }
-    } catch (e) {
-      // File not found, skip
-    }
+    } catch (e) {}
   }
 
   return contextDocs || 'Tidak ada dokumen yang tersedia';
@@ -425,7 +451,7 @@ async function executeTools(toolCalls, store) {
   return results;
 }
 
-async function synthesizeResponse(aiGateway, userMessage, toolResults) {
+async function synthesizeResponse(apiKey, userMessage, toolResults) {
   const resultsText = toolResults.map(r => {
     const status = r.result.success ? 'SUCCESS' : 'ERROR';
     const content = r.result.success ? JSON.stringify(r.result, null, 2) : r.result.error;
@@ -433,22 +459,37 @@ async function synthesizeResponse(aiGateway, userMessage, toolResults) {
   }).join('\n\n');
   
   try {
-    const { text } = await generateText({
-      model: aiGateway("@makers/deepseek-v4-flash"),
-      messages: [
-        { 
-          role: 'system', 
-          content: 'Kamu adalah AI assistant. Berdasarkan hasil tool execution berikut, berikan jawaban yang jelas, lengkap, dan natural dalam bahasa Indonesia. Jangan sebutkan "tool" atau "execution", langsung berikan jawaban final.' 
-        },
-        { 
-          role: 'user', 
-          content: `Pertanyaan asli: ${userMessage}\n\nHasil dari tools:\n${resultsText}\n\nBerikan jawaban final yang natural dan lengkap.` 
-        }
-      ],
+    const response = await fetch('https://ai-gateway.edgeone.link/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: '@makers/deepseek-v4-flash',
+        messages: [
+          { 
+            role: 'system', 
+            content: 'Kamu adalah AI assistant. Berdasarkan hasil tool execution berikut, berikan jawaban yang jelas, lengkap, dan natural dalam bahasa Indonesia. Jangan sebutkan "tool" atau "execution", langsung berikan jawaban final.' 
+          },
+          { 
+            role: 'user', 
+            content: `Pertanyaan asli: ${userMessage}\n\nHasil dari tools:\n${resultsText}\n\nBerikan jawaban final yang natural dan lengkap.` 
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 2000,
+      }),
     });
-    
-    return text;
+
+    if (!response.ok) {
+      throw new Error(`AI Gateway returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
   } catch (error) {
+    console.error('synthesizeResponse error:', error);
     return `Berikut hasil dari tools:\n\n${resultsText}`;
   }
 }
