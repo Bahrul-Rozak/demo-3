@@ -1,9 +1,6 @@
 import { createAiGateway } from "@edgeone/makers-models-provider";
 import { generateText } from "ai";
 import { getStore } from "@edgeone/pages-blob";
-import { executeCode } from "../tools/code-executor.js";
-import { parseFile } from "../tools/file-parser.js";
-import { scrapeWeb } from "../tools/web-scraper.js";
 
 const BLOB_NAMESPACE = "memory-makers-cfyznvtdex4f";
 
@@ -22,7 +19,8 @@ export async function onRequestPost(context) {
   const startTime = Date.now();
 
   try {
-    const { message, conversation_id } = await request.json();
+    const body = await request.json();
+    const { message, conversation_id } = body;
 
     if (!message || !conversation_id) {
       return new Response(JSON.stringify({ 
@@ -106,13 +104,130 @@ export async function onRequestPost(context) {
   } catch (error) {
     console.error('Agent error:', error);
     return new Response(JSON.stringify({ 
-      error: error.message 
+      error: error.message,
+      stack: error.stack
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   }
 }
+
+// ========== TOOL IMPLEMENTATIONS ==========
+
+async function executeCode(code, language = 'javascript') {
+  try {
+    if (language === 'javascript') {
+      const result = await new Promise((resolve) => {
+        try {
+          const func = new Function(code);
+          const output = func();
+          resolve({ success: true, output: output });
+        } catch (error) {
+          resolve({ success: false, error: error.message });
+        }
+      });
+      return result;
+    } else {
+      return { 
+        success: false, 
+        error: 'Python execution not supported. Use JavaScript instead.' 
+      };
+    }
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function parseFile(fileName, store) {
+  try {
+    const content = await store.get(`documents/${fileName}`);
+    
+    if (!content) {
+      return { success: false, error: 'File not found' };
+    }
+
+    if (fileName.endsWith('.csv')) {
+      return parseCSV(content);
+    } else if (fileName.endsWith('.json')) {
+      return parseJSON(content);
+    } else {
+      return { success: true, type: 'text', content: content };
+    }
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function parseCSV(content) {
+  const lines = content.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim());
+  const data = [];
+  
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(',').map(v => v.trim());
+    const row = {};
+    headers.forEach((header, index) => {
+      row[header] = values[index];
+    });
+    data.push(row);
+  }
+  
+  return { 
+    success: true, 
+    type: 'csv', 
+    headers: headers,
+    data: data,
+    rowCount: data.length
+  };
+}
+
+function parseJSON(content) {
+  try {
+    const data = JSON.parse(content);
+    return { success: true, type: 'json', data: data };
+  } catch (error) {
+    return { success: false, error: 'Invalid JSON format' };
+  }
+}
+
+async function scrapeWeb(url) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; EdgeOneBot/1.0)'
+      }
+    });
+    
+    if (!response.ok) {
+      return { success: false, error: `HTTP ${response.status}` };
+    }
+    
+    const html = await response.text();
+    
+    const textContent = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].trim() : 'No title';
+    
+    return {
+      success: true,
+      url: url,
+      title: title,
+      content: textContent.substring(0, 5000),
+      contentLength: textContent.length
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// ========== HELPER FUNCTIONS ==========
 
 async function loadConversationHistory(store, conversationId) {
   try {
@@ -259,7 +374,7 @@ async function executeTools(toolCalls, store) {
     if (call.tool === 'execute_code') {
       result = await executeCode(call.params.code, call.params.language);
     } else if (call.tool === 'parse_file') {
-      result = await parseFile(call.params.fileName, BLOB_NAMESPACE);
+      result = await parseFile(call.params.fileName, store);
     } else if (call.tool === 'scrape_web') {
       result = await scrapeWeb(call.params.url);
     } else {
